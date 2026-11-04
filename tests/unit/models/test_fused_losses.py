@@ -352,6 +352,7 @@ def test_autotuner_never_picks_a_spilling_tile(term_names):
             stats.stride(0),
             vocab,
             TERMS=terms,
+            DELTA=False,
             BLOCK_SIZE=block,
             num_warps=warps,
         )
@@ -367,6 +368,7 @@ def test_autotuner_never_picks_a_spilling_tile(term_names):
             stats.stride(0),
             vocab,
             TERMS=terms,
+            DELTA=False,
             BLOCK_SIZE=block,
             num_warps=warps,
         )

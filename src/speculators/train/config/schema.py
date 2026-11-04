@@ -321,13 +321,29 @@ class LossArgs(_Group):
         "(no target recompute; keeps one [T, V] tensor). Ignored by the other "
         "implementations.",
     )
-    fused_linear_logits: Literal["input", "float32"] = Field(
-        default="input",
+    fused_linear_logits: Literal["input", "float32", "float16"] = Field(
+        default="float16",
         description="With loss_implementation=fused_linear: dtype of the logit "
-        "tiles. input keeps them in the training dtype (bf16), like materialized "
-        "logits; float32 takes them from the GEMM accumulator -- more accurate "
-        "gradients (notably for TV-based losses), slower GEMMs. Ignored by the "
-        "other implementations.",
+        "tiles. float16 (default) casts the bf16 operands to fp16 (exact) for "
+        "8x finer logit rounding than bf16 at the same tile size and about the "
+        "same speed, keeping cached fp16 copies of the frozen heads; with the "
+        "shared head (--fused-linear-shared-head) KL / TV gradients are within "
+        "~0.1-0.2 points of fp32. float32 takes the tiles from the GEMM "
+        "accumulator (~10% slower loss head); input keeps them in the training "
+        "dtype like materialized logits (today's numerics). Ignored by the other "
+        "implementations.",
+    )
+    fused_linear_shared_head: Literal["auto", "off"] = Field(
+        default="auto",
+        description="With loss_implementation=fused_linear and recomputed targets: "
+        "when the drafter's lm_head equals the verifier's (DFlash loads both "
+        "from the verifier; checked when weights are loaded), auto forms the "
+        "draft logits as target + a delta GEMM on (hidden - verifier hidden), "
+        "whose rounding scales with the small delta, so the draft-target logit "
+        "difference that KL / TV gradients depend on is near-exact. Used for "
+        "distribution losses (no effect on CE alone); same GEMM count. off "
+        "always projects the draft hidden states. Ignored by the other "
+        "implementations.",
     )
     loss_fn: str | None = Field(
         default=None,

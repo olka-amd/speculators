@@ -312,7 +312,8 @@ def test_dflash_fused_linear_target_mode(monkeypatch):
     )
     train_kw, _ = DFlashDraftModel.get_trainer_kwargs(**vars(args))
     assert train_kw["fused_linear_targets"] == "materialize"
-    assert train_kw["fused_linear_logits"] == "input"
+    assert train_kw["fused_linear_logits"] == "float16"
+    assert train_kw["fused_linear_shared_head"] == "auto"
 
     args = _parse(
         monkeypatch,
@@ -320,3 +321,21 @@ def test_dflash_fused_linear_target_mode(monkeypatch):
     )
     train_kw, _ = DFlashDraftModel.get_trainer_kwargs(**vars(args))
     assert train_kw["fused_linear_logits"] == "float32"
+
+    args = _parse(
+        monkeypatch,
+        [
+            "--loss-implementation",
+            "fused_linear",
+            "--fused-linear-logits",
+            "input",
+            "--fused-linear-shared-head",
+            "off",
+        ],
+    )
+    train_kw, val_kw = DFlashDraftModel.get_trainer_kwargs(**vars(args))
+    assert train_kw["fused_linear_logits"] == "input"
+    assert train_kw["fused_linear_shared_head"] == "off"
+    assert val_kw["fused_linear_shared_head"] == "off"
+    with pytest.raises(SystemExit):
+        _parse(monkeypatch, ["--fused-linear-shared-head", "on"])

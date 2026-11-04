@@ -96,15 +96,19 @@ def test_lk_hybrid_gradient_matches_eager():
     torch.testing.assert_close(x.grad, y.grad, rtol=1e-4, atol=1e-6)
 
 
-def _opcheck_args(device, dtype, recompute_targets, deferred=False):
+def _opcheck_args(device, dtype, recompute_targets, deferred=False, shared=False):
     h, w, t = _inputs(13, 8, 40, dtype, device, seed=3)
     target_weight = None
     if recompute_targets:
         # verifier hidden [N, H_t] and verifier lm_head [V, H_t]
         t = torch.randn(13, 6, device=device, dtype=dtype)
         target_weight = torch.randn(40, 6, device=device, dtype=dtype)
+    if shared:
+        # shared head: verifier hidden [N, H] and the draft head itself
+        t = torch.randn(13, 8, device=device, dtype=dtype)
+        target_weight = w
     _, _, stats, _ = torch.ops.speculators.fused_linear_loss_fwd(
-        h, w, t, target_weight, ALL_TERMS, ALL_TERMS, 5, False, False
+        h, w, t, target_weight, ALL_TERMS, ALL_TERMS, 5, False, "input", shared
     )
     grad = torch.randn(5, 13, device=device, dtype=stats.dtype)
     fwd = (
@@ -116,16 +120,19 @@ def _opcheck_args(device, dtype, recompute_targets, deferred=False):
         DEFERRED_TERMS if deferred else ALL_TERMS,
         5,
         deferred,
-        False,
+        "input",
+        shared,
     )
-    bwd = (grad, h, w, t, target_weight, stats, ALL_TERMS, 5, False)
+    bwd = (grad, h, w, t, target_weight, stats, ALL_TERMS, 5, "input", shared)
     return fwd, bwd
 
 
 @pytest.mark.parametrize("deferred", [False, True])
-@pytest.mark.parametrize("recompute_targets", [False, True])
-def test_opcheck_cpu(recompute_targets, deferred):
-    fwd, bwd = _opcheck_args("cpu", torch.float64, recompute_targets, deferred)
+@pytest.mark.parametrize("targets", ["logits", "verifier", "shared"])
+def test_opcheck_cpu(targets, deferred):
+    fwd, bwd = _opcheck_args(
+        "cpu", torch.float64, targets != "logits", deferred, targets == "shared"
+    )
     opcheck(torch.ops.speculators.fused_linear_loss_fwd.default, fwd)
     opcheck(torch.ops.speculators.fused_linear_loss_bwd.default, bwd)
 
@@ -296,9 +303,11 @@ def test_no_host_syncs():
 
 @requires_accelerator
 @pytest.mark.parametrize("deferred", [False, True])
-@pytest.mark.parametrize("recompute_targets", [False, True])
-def test_opcheck_gpu(recompute_targets, deferred):
-    fwd, bwd = _opcheck_args(DEVICE, torch.float32, recompute_targets, deferred)
+@pytest.mark.parametrize("targets", ["logits", "verifier", "shared"])
+def test_opcheck_gpu(targets, deferred):
+    fwd, bwd = _opcheck_args(
+        DEVICE, torch.float32, targets != "logits", deferred, targets == "shared"
+    )
     opcheck(torch.ops.speculators.fused_linear_loss_fwd.default, fwd)
     opcheck(torch.ops.speculators.fused_linear_loss_bwd.default, bwd)
 

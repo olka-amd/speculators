@@ -44,6 +44,10 @@ SAMPLE_FROM_ANCHOR = {"dflash": False, "dspark": True}
 FUSED_LINEAR_IMPLEMENTATIONS = (
     "fused_linear",
     "fused_linear_fp32",
+    "fused_linear_shared",
+    "fused_linear_shared_fp32",
+    "fused_linear_fp16",
+    "fused_linear_shared_fp16",
     "fused_linear_materialize",
 )
 IMPLEMENTATIONS = ("fused", "eager", *FUSED_LINEAR_IMPLEMENTATIONS)
@@ -132,18 +136,26 @@ def loss_head(cfg: HeadConfig, inputs: HeadInputs) -> tuple[torch.Tensor, dict]:
 
     ``fused`` and ``eager`` project the draft logits with ``lm_head`` first.
     The fused-linear implementations (DFlash only) never materialise the draft
-    logits: ``fused_linear`` (the model default) also recomputes the target
-    logits per chunk from the verifier hidden states (bf16 tiles, deferred
-    gradients, anchor rows skipped), ``fused_linear_fp32`` does the same with
-    fp32 logit tiles, and
-    ``fused_linear_materialize`` takes the target logits materialised.
+    logits. All but ``fused_linear_materialize`` (target logits materialised)
+    recompute the target logits per chunk from the verifier hidden states,
+    with deferred gradients and anchor rows skipped. The suffix is the logit
+    tile dtype: none = bf16 (today's numerics), ``_fp16``, ``_fp32``.
+    ``fused_linear_shared_*`` use DFlash's shared head (the drafter's
+    ``lm_head`` is the verifier's; ``verifier_weight`` serves as both):
+    draft logits as target + a delta GEMM. The DFlash model default is
+    ``fused_linear_shared_fp16``.
 
     Eager, without ``torch.autocast`` or ``torch.compile``: inputs are created
     in ``cfg.dtype``, as the trainer precasts the frozen heads. DSpark runs
     without its confidence head (per-row work, not ``[N, V]``).
     """
     fused_linear = cfg.implementation in FUSED_LINEAR_IMPLEMENTATIONS
-    recompute_targets = cfg.implementation in ("fused_linear", "fused_linear_fp32")
+    shared_head = cfg.implementation.startswith("fused_linear_shared")
+    recompute_targets = shared_head or cfg.implementation == "fused_linear"
+    recompute_targets |= cfg.implementation in (
+        "fused_linear_fp32",
+        "fused_linear_fp16",
+    )
     loss_config = cached_loss_config(
         cfg.loss, "fused" if fused_linear else cfg.implementation
     )
@@ -167,14 +179,17 @@ def loss_head(cfg: HeadConfig, inputs: HeadInputs) -> tuple[torch.Tensor, dict]:
             raise ValueError(f"{cfg.implementation} is only supported for dflash")
         return dflash_metrics.compute_metrics_from_hidden(
             inputs.hidden.unsqueeze(0),
-            inputs.weight,
+            inputs.verifier_weight if shared_head else inputs.weight,
             targets,
             inputs.loss_mask,
             target_weight=inputs.verifier_weight if recompute_targets else None,
             logits_dtype=(
-                "float32" if cfg.implementation == "fused_linear_fp32" else "input"
+                {"_fp32": "float32", "_fp16": "float16"}.get(
+                    cfg.implementation[-5:], "input"
+                )
             ),
             skip_anchor_rows=True,
+            shared_head=shared_head,
             **dflash_kwargs,
         )
     logits = F.linear(inputs.hidden, inputs.weight)

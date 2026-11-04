@@ -3,6 +3,7 @@ from typing import ClassVar
 
 import torch
 from torch import nn
+from torch.distributed.tensor import DTensor
 from torch.nn.attention.flex_attention import create_block_mask, create_mask
 from transformers import PretrainedConfig
 from transformers.models.qwen3.modeling_qwen3 import (
@@ -163,6 +164,10 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
         self.__dict__["_keys_to_ignore_on_load_missing"] = (
             keys_to_ignore_on_load_missing
         )
+        # Whether lm_head equals verifier_lm_head (fused_linear shared-head
+        # mode). Refreshed whenever weights are loaded, never per step.
+        self._shared_lm_heads = False
+        self.register_load_state_dict_post_hook(_refresh_shared_lm_heads_hook)
 
     @property
     def target_layer_ids(self) -> list[int]:
@@ -175,6 +180,37 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
             overwrite_embed_tokens=True,
             overwrite_lm_head=not self.use_draft_vocab,
         )
+        self.refresh_shared_lm_heads()
+
+    @torch.no_grad()
+    def refresh_shared_lm_heads(self) -> bool:
+        """Record whether ``lm_head`` and ``verifier_lm_head`` hold equal weights.
+
+        DFlash loads both from the verifier head, so they are equal unless a
+        checkpoint brought a different (trained) ``lm_head``. The
+        ``fused_linear`` loss then forms the draft logits as target + delta
+        (see ``fused_linear_compound(shared_head=...)``). Called after every
+        weight load; call it again after modifying either head in place.
+        """
+        draft, verifier = self.lm_head.weight, self.verifier_lm_head.weight
+        shared = (
+            draft.shape == verifier.shape
+            and draft.dtype == verifier.dtype
+            and draft.device == verifier.device
+            and not (draft.is_meta or verifier.is_meta)
+        )
+        if shared:
+            if isinstance(draft, DTensor) and isinstance(verifier, DTensor):
+                # FSDP2: compare the local shards, then agree across ranks
+                local = draft.to_local()
+                equal = torch.equal(local, verifier.to_local())
+                flag = torch.tensor([float(equal)], device=local.device)
+                torch.distributed.all_reduce(flag, op=torch.distributed.ReduceOp.MIN)
+                shared = bool(flag.item())
+            else:
+                shared = torch.equal(draft, verifier)
+        self._shared_lm_heads = shared
+        return shared
 
     @classmethod
     def from_training_args(
@@ -312,7 +348,8 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
             "dpace_alpha": dpace_alpha,
             "fused_linear": fused_linear,
             "fused_linear_targets": kwargs.get("fused_linear_targets", "recompute"),
-            "fused_linear_logits": kwargs.get("fused_linear_logits", "input"),
+            "fused_linear_logits": kwargs.get("fused_linear_logits", "float16"),
+            "fused_linear_shared_head": kwargs.get("fused_linear_shared_head", "auto"),
         }
         return dict(shared), dict(shared)
 
@@ -534,10 +571,16 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
         dpace_alpha: float = 0.5,
         fused_linear: bool = False,
         fused_linear_targets: str = "recompute",
-        fused_linear_logits: str = "input",
+        fused_linear_logits: str = "float16",
+        fused_linear_shared_head: str = "auto",
         **kwargs,
     ):
         recompute_targets = fused_linear and fused_linear_targets == "recompute"
+        shared_head = (
+            recompute_targets
+            and fused_linear_shared_head == "auto"
+            and self._shared_lm_heads
+        )
         hidden, logits, targets, aligned_loss_mask, _ = self._backbone_forward(
             hidden_states,
             input_ids,
@@ -570,6 +613,10 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
                     self.verifier_lm_head.weight if recompute_targets else None
                 ),
                 logits_dtype=fused_linear_logits,
+                # lm_head == verifier_lm_head: draft logits = target + a
+                # low-magnitude delta GEMM, near-fp32 accurate with fp32
+                # target tiles for one fp32 GEMM.
+                shared_head=shared_head,
                 # aligned_loss_mask masks slot 0 when not sampling from the
                 # anchor (above), so those rows need not be projected at all.
                 skip_anchor_rows=True,
@@ -584,3 +631,8 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
             **metric_kwargs,
         )
         return None, loss, metrics
+
+
+def _refresh_shared_lm_heads_hook(module, _incompatible_keys) -> None:
+    """``load_state_dict`` post-hook: re-check the shared-head flag."""
+    module.refresh_shared_lm_heads()

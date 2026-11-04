@@ -82,6 +82,7 @@ def compute_metrics_from_hidden(
     logits_dtype: str = "input",
     grad_mode: str = "auto",
     skip_anchor_rows: bool = False,
+    shared_head: bool = False,
 ) -> tuple[torch.Tensor, dict]:
     """``compute_metrics`` without materializing the draft logits.
 
@@ -91,7 +92,8 @@ def compute_metrics_from_hidden(
     resolved with the ``"fused"`` implementation. With ``target_weight``
     (the verifier ``lm_head``), ``targets`` holds the gathered post-norm
     verifier hidden states ``[1, T, H]`` and the target logits are recomputed
-    per chunk as well. ``logits_dtype`` and ``grad_mode`` are passed to
+    per chunk as well. ``logits_dtype``, ``grad_mode`` and ``shared_head``
+    (``lm_head_weight`` equals ``target_weight``) are passed to
     ``fused_linear_compound``.
 
     With ``skip_anchor_rows`` and ``sample_from_anchor=False``, slot 0 of every
@@ -118,6 +120,7 @@ def compute_metrics_from_hidden(
             logits_dtype=logits_dtype,
             grad_mode=grad_mode,
             rows=rows,
+            shared_head=shared_head,
         ),
         loss_mask,
         block_size=block_size,
