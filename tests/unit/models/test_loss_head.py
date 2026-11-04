@@ -243,7 +243,12 @@ def _assert_head_close(cfg, dtype, loss_tol, grad_tol, implementation="fused"):
 
 
 # fused_linear (no materialized draft logits) covers DFlash only.
-IMPLEMENTATIONS = ["fused", "fused_linear", "fused_linear_materialize"]
+IMPLEMENTATIONS = [
+    "fused",
+    "fused_linear",
+    "fused_linear_fp32",
+    "fused_linear_materialize",
+]
 
 
 def _skip_unsupported(name: str, implementation: str) -> None:
@@ -272,6 +277,7 @@ def test_fused_fp32_matches_eager_reference(name, implementation):
 # GPUs or CUDA builds may need them widened. TV-based terms are the least
 # accurate: their gradient switches on dp <= tp, which bf16 logits flip near
 # ties, so the 0.1-0.4 bounds there only catch gross breakage, not precision.
+# Every implementation must stay below these.
 BF16_LOSS_RTOL = 2e-3
 BF16_GRAD_ERR_BOUND = {
     "dflash-ce": 9e-3,
