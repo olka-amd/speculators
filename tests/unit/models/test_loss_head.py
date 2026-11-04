@@ -222,9 +222,9 @@ def test_eager_fp32_matches_golden(name):
             )
 
 
-def _assert_head_close(cfg, dtype, loss_tol, grad_tol):
+def _assert_head_close(cfg, dtype, loss_tol, grad_tol, implementation="fused"):
     ref_loss, ref_metrics, ref_grads = _reference(cfg, input_dtype=dtype)
-    fused_cfg = dataclasses.replace(cfg, implementation="fused")
+    fused_cfg = dataclasses.replace(cfg, implementation=implementation)
     device = "cuda"
     loss, metrics, grads = _run(fused_cfg, _inputs(fused_cfg, device, dtype))
     torch.testing.assert_close(loss, ref_loss, **loss_tol)
@@ -242,14 +242,26 @@ def _assert_head_close(cfg, dtype, loss_tol, grad_tol):
         )
 
 
+# fused_linear (no materialized draft logits) covers DFlash only.
+IMPLEMENTATIONS = ["fused", "fused_linear"]
+
+
+def _skip_unsupported(name: str, implementation: str) -> None:
+    if implementation == "fused_linear" and CASES[name].model != "dflash":
+        pytest.skip("fused_linear supports DFlash only")
+
+
 @requires_cuda
+@pytest.mark.parametrize("implementation", IMPLEMENTATIONS)
 @pytest.mark.parametrize("name", sorted(CASES))
-def test_fused_fp32_matches_eager_reference(name):
+def test_fused_fp32_matches_eager_reference(name, implementation):
+    _skip_unsupported(name, implementation)
     _assert_head_close(
         CASES[name],
         torch.float32,
         loss_tol={"rtol": 1e-4, "atol": 1e-5},
         grad_tol={"rtol": 1e-3, "atol": 1e-4},
+        implementation=implementation,
     )
 
 
@@ -284,11 +296,14 @@ def test_bf16_bounds_cover_every_case():
 
 
 @requires_cuda
+@pytest.mark.parametrize("implementation", IMPLEMENTATIONS)
 @pytest.mark.parametrize("name", sorted(CASES))
-def test_fused_bf16_error_vs_eager_reference(name):
+def test_fused_bf16_error_vs_eager_reference(name, implementation):
+    """fused_linear (fp32 logits) must stay within today's measured bounds."""
+    _skip_unsupported(name, implementation)
     cfg = CASES[name]
     ref_loss, _, ref_grads = _reference(cfg, input_dtype=torch.bfloat16)
-    fused_cfg = dataclasses.replace(cfg, implementation="fused")
+    fused_cfg = dataclasses.replace(cfg, implementation=implementation)
     device = "cuda"
     loss, _, grads = _run(fused_cfg, _inputs(fused_cfg, device, torch.bfloat16))
     torch.testing.assert_close(loss, ref_loss, rtol=BF16_LOSS_RTOL, atol=0.0)
