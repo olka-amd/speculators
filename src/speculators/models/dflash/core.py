@@ -210,6 +210,10 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
             else:
                 shared = torch.equal(draft, verifier)
         self._shared_lm_heads = shared
+        # Weight loads can refill a head without bumping the version counter
+        # the fused_linear weight-copy cache checks (FSDP2 preserves it when
+        # it all-gathers parameters), so drop the cached copies here.
+        _clear_fused_linear_weight_cache()
         return shared
 
     @classmethod
@@ -636,3 +640,12 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
 def _refresh_shared_lm_heads_hook(module, _incompatible_keys) -> None:
     """``load_state_dict`` post-hook: re-check the shared-head flag."""
     module.refresh_shared_lm_heads()
+
+
+def _clear_fused_linear_weight_cache() -> None:
+    """Drop fused_linear's cached head copies (no-op without Triton)."""
+    try:
+        from speculators.losses import fused_linear  # noqa: PLC0415
+    except ImportError:
+        return
+    fused_linear.clear_weight_cache()

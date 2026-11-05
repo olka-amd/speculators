@@ -141,3 +141,36 @@ def test_shared_head_bf16_autocast_compiled(logits):
             grads_fl[name].flatten(), grad.flatten(), dim=0
         )
         assert cosine > 0.99, (name, float(cosine))
+
+
+@requires_gpu
+def test_reload_drops_cached_head_copies(monkeypatch):
+    """FSDP2 refills all-gathered parameters without bumping their version
+    counter, which the weight-copy cache checks; a weight load must therefore
+    drop the cached fp16 / [H, V] copies (seen stale in an FSDP2 probe)."""
+    monkeypatch.setenv("SPECULATORS_FUSED_LINEAR_BUDGET_MIB", "1")
+    model = _share_heads(_model(False, torch.bfloat16))
+    model.refresh_shared_lm_heads()
+    inputs = _inputs(torch.bfloat16)
+    spec = '{"kl_div": 0.5, "tv": 0.5}'
+
+    def losses():
+        out = {}
+        for impl in ("fused", "fused_linear"):
+            kwargs, _ = DFlashDraftModel.get_trainer_kwargs(
+                loss_fn=spec, loss_implementation=impl, max_anchors=32
+            )
+            torch.manual_seed(2)
+            with torch.no_grad(), torch.compiler.set_stance("force_eager"):
+                out[impl] = float(model(**inputs, **kwargs)[1])
+        return out
+
+    losses()  # fills the cache
+    heads = (model.lm_head.weight, model.verifier_lm_head.weight)
+    with torch.no_grad():
+        for weight in heads:
+            with torch.autograd._unsafe_preserve_version_counter(weight):
+                weight.mul_(1.7).add_(0.05)
+    model.refresh_shared_lm_heads()  # what the load hooks run
+    out = losses()
+    torch.testing.assert_close(out["fused_linear"], out["fused"], rtol=2e-2, atol=0)

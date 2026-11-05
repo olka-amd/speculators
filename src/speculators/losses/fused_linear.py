@@ -122,6 +122,9 @@ def _fp16_tile(dtype: torch.dtype, tile: str) -> bool:
 # entry is valid only while its source is alive (weakref, removed with it)
 # and unmodified (same version counter); rebuilding a copy of a 1.2 GB head
 # costs ~1-3 ms, so they are kept across calls (one head-sized tensor each).
+# Code that rewrites a weight while preserving its version counter (FSDP2
+# does when it all-gathers parameters) must call clear_weight_cache() after
+# loading new values; DFlash does so in refresh_shared_lm_heads.
 _WEIGHT_COPIES: dict[tuple[int, str], tuple[weakref.ref, int, torch.Tensor]] = {}
 
 
