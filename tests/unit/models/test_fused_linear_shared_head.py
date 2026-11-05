@@ -91,6 +91,8 @@ def test_delta_kernels_match_materialized_sum(vocab, names):
             dz,
             rows * vocab,
             vocab,
+            None,
+            0,
             TERMS=mask,
             GRAD_TERMS=mask,
             DZ_KL=slot.get("kl_div", 0),
@@ -99,6 +101,7 @@ def test_delta_kernels_match_materialized_sum(vocab, names):
             DZ_CE=slot.get("ce", 0),
             DZ_TV=slot.get("tv", 0),
             DELTA=delta_mode,
+            FOLD=False,
         )
         out[delta_mode] = (lo, am, dz)
     assert torch.equal(out[True][1], out[False][1])
@@ -180,7 +183,7 @@ def test_chunk_rows_shared_head_budget():
     both_fp32 = fl.chunk_rows_for(
         vocab, torch.bfloat16, 1 << 20, recompute_targets=True, fp32_logits=True
     )
-    assert shared == 2048
+    assert shared == 4096
     assert both_fp32 == 2048
     tight = {"SPECULATORS_FUSED_LINEAR_BUDGET_MIB": "1024"}
     with pytest.MonkeyPatch.context() as mp:

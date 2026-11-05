@@ -52,7 +52,7 @@ the row count changes).
 
 import os
 import weakref
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 
 import torch
 
@@ -61,16 +61,17 @@ from speculators.losses import fused
 __all__ = ["chunk_rows_for", "fused_linear_compound"]
 
 # Peak scratch the chunk loop may use, in MiB, and the chunk-size cap.
-# Measured on MI355X (hipBLASLt, H = 4096, V = 152k, ms per 1k rows): the
-# projection runs at full-GEMM speed from ~768 rows up; the dz @ W
-# contraction is shape-sensitive -- 1.80-1.91 at 1024, 1792, 2048, 4096,
-# 6144 and 8192 rows but 2.4-3.1 at 1536, 3072, 3584, 3840 and 5120. 2048-row
-# chunks are the fastest for both GEMMs and halve the scratch of 4096, so the
-# budget only lowers the chunk below that (e.g. fp32 tiles at large V).
+# Measured on MI355X (hipBLASLt, H = 4096): the dz @ W contraction is
+# shape-sensitive (fast at 1024, 1792, 2048, 4096, 6144 and 8192 rows, up to
+# 2.5x slower per row at 512, 1536, 2560, 3072 and 3584). With the GPU shared
+# with another job, 4096-row chunks ran the loss head 10-25% faster than
+# 2048-row ones (interleaved A/B, DFlash and DSpark, T = 8192, V = 110k), so
+# the cap is 4096; the budget lowers the chunk where scratch demands it
+# (fp32 tiles, several gradient slabs at large V).
 _BUDGET_ENV = "SPECULATORS_FUSED_LINEAR_BUDGET_MIB"
 _DEFAULT_BUDGET_MIB = 4096
 _MIN_CHUNK_ROWS = 64
-_MAX_CHUNK_ROWS = 2048
+_MAX_CHUNK_ROWS = 4096
 _LOG2 = 0.6931471805599453
 GRAD_MODES = ("auto", "deferred", "recompute")
 LOGITS_DTYPES = ("input", "float32", "float16")
@@ -128,14 +129,22 @@ def _fp16_tile(dtype: torch.dtype, tile: str) -> bool:
 _WEIGHT_COPIES: dict[tuple[int, str], tuple[weakref.ref, int, torch.Tensor]] = {}
 
 
-def _weight_copy(weight: torch.Tensor, kind: str) -> torch.Tensor:
+def _weight_copy(
+    weight: torch.Tensor,
+    kind: str,
+    build: Callable[[torch.Tensor], torch.Tensor] | None = None,
+) -> torch.Tensor:
+    """The cached ``kind`` copy of ``weight``: ``build(weight)``, or the fp16
+    (``"fp16"``) or contiguous transposed (``"t"``) copy."""
     key = (id(weight), kind)
     entry = _WEIGHT_COPIES.get(key)
     version = weight._version  # noqa: SLF001 -- bumped by in-place writes
     if entry is not None and entry[0]() is weight and entry[1] == version:
         return entry[2]
     with torch.no_grad():
-        if kind == "fp16":
+        if build is not None:
+            copy = build(weight.detach())
+        elif kind == "fp16":
             copy = weight.detach().to(torch.float16)
         else:
             copy = weight.detach().t().contiguous()
@@ -384,6 +393,8 @@ def _forward_deferred_chunk(
         dz,
         rows * vocab,
         vocab,
+        None,
+        0,
         TERMS=terms,
         GRAD_TERMS=grad_terms,
         DZ_KL=slot.get("kl_div", 0),
@@ -392,6 +403,7 @@ def _forward_deferred_chunk(
         DZ_CE=slot.get("ce", 0),
         DZ_TV=slot.get("tv", 0),
         DELTA=delta,
+        FOLD=False,
     )
     for k in range(len(names)):
         _contract(dz[k], weight, out=jac[k, start:end])

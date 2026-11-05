@@ -19,6 +19,7 @@ import torch
 from torch.nn.functional import binary_cross_entropy_with_logits
 
 from speculators.losses import (
+    CompoundLossOutput,
     LossConfig,
     compound_loss_with_outputs,
     dflash_loss_decay,
@@ -32,6 +33,7 @@ from speculators.models.metrics import (
 
 __all__ = [
     "compute_metrics",
+    "compute_metrics_from_hidden",
 ]
 
 _EPS = 1e-8
@@ -54,6 +56,26 @@ def _masked_decayed_mean(
     return (weighted.sum(dim=1) / denominator).mean()
 
 
+def _decay_fn(
+    per_position_loss_weight: str,
+    loss_mask: torch.Tensor,
+    block_size: int,
+    dpace_alpha: float,
+    gamma: float,
+    sample_from_anchor: bool,
+) -> Callable[..., torch.Tensor]:
+    if per_position_loss_weight == "dpace":
+        return partial(
+            dpace_loss_decay,
+            loss_mask=loss_mask,
+            block_size=block_size,
+            dpace_alpha=dpace_alpha,
+        )
+    return partial(
+        dflash_loss_decay, gamma=gamma, sample_from_anchor=sample_from_anchor
+    )
+
+
 def compute_metrics(
     logits: torch.Tensor,  # [1, T, draft_vocab_size] (Markov-corrected)
     targets: torch.Tensor,  # [1, T, draft_vocab_size]
@@ -70,22 +92,16 @@ def compute_metrics(
 ) -> tuple[torch.Tensor, dict]:
     """Compute the DSpark loss and a metrics dict (``*_sum``/``*_total`` pairs)."""
 
-    device = logits.device
     seq_len = logits.shape[1]
-    pos_idx = (torch.arange(seq_len, device=device) % block_size).unsqueeze(0)
-    start_pos = 0 if sample_from_anchor else 1
-    if per_position_loss_weight == "dpace":
-        decay_fn = partial(
-            dpace_loss_decay,
-            loss_mask=loss_mask,
-            block_size=block_size,
-            dpace_alpha=dpace_alpha,
-        )
-    else:
-        decay_fn = partial(
-            dflash_loss_decay, gamma=gamma, sample_from_anchor=sample_from_anchor
-        )
-
+    pos_idx = (torch.arange(seq_len, device=logits.device) % block_size).unsqueeze(0)
+    decay_fn = _decay_fn(
+        per_position_loss_weight,
+        loss_mask,
+        block_size,
+        dpace_alpha,
+        gamma,
+        sample_from_anchor,
+    )
     # With an all-fused config the TV behind accept_rate and both argmaxes
     # come from the loss's own kernel pass (TV as a metric-only term when the
     # loss does not use it); otherwise they are computed separately below.
@@ -98,6 +114,135 @@ def compute_metrics(
         decay_fn=decay_fn,
         metric_terms=("tv",),
     )
+    return _finish(
+        out,
+        lambda: tv_loss_fn(logits, targets),
+        confidence_logits,
+        loss_mask,
+        block_size,
+        gamma=gamma,
+        confidence_head_alpha=confidence_head_alpha,
+        sample_from_anchor=sample_from_anchor,
+    )
+
+
+def compute_metrics_from_hidden(
+    hidden: torch.Tensor,  # [1, T, hidden_size] final draft hidden states
+    lm_head_weight: torch.Tensor,  # [draft_vocab_size, hidden_size], frozen
+    targets: torch.Tensor,  # [1, T, draft_vocab_size] or [1, T, H] (target_weight)
+    markov_features: torch.Tensor | None,  # [1, T, r]: markov_w2's input
+    markov_weight: torch.Tensor | None,  # [draft_vocab_size, r], trainable
+    confidence_logits: torch.Tensor | None,  # [1, T] or None
+    loss_mask: torch.Tensor,  # [1, T]
+    block_size: int,
+    loss_config: LossConfig,
+    gamma: float = 4.0,
+    confidence_head_alpha: float = 1.0,
+    per_position_loss_weight: str = "fixed-exp-decay",
+    dpace_alpha: float = 0.5,
+    sample_from_anchor: bool = True,
+    target_weight: torch.Tensor | None = None,
+    logits_dtype: str = "input",
+    shared_head: bool = False,
+) -> tuple[torch.Tensor, dict]:
+    """``compute_metrics`` without the ``[1, T, V]`` draft logits.
+
+    The draft logits ``hidden @ lm_head.T + markov_features @ markov_w2.T``
+    are formed chunk by chunk inside ``fused_linear_reduced``, which also
+    reduces the loss and forms every gradient (incl. the trainable
+    ``markov_w2``'s) in forward; ``loss_config`` must be resolved with the
+    ``"fused"`` implementation. With ``target_weight`` (the verifier
+    ``lm_head``) ``targets`` holds the gathered post-norm verifier hidden
+    states. Metrics are those of ``compute_metrics``.
+    """
+    from speculators.losses import fused_linear_reduced as flr  # noqa: PLC0415
+    from speculators.losses.utils import (  # noqa: PLC0415
+        _FUSED_NAME_BY_FN,
+        _weighted_sum,
+    )
+
+    names = []
+    for fn, _ in loss_config.values():
+        name = _FUSED_NAME_BY_FN.get(fn)
+        if name is None:
+            raise ValueError(
+                "compute_metrics_from_hidden needs a loss config resolved with "
+                "the 'fused' implementation"
+            )
+        names.append(name)
+    seq_len = hidden.shape[1]
+    pos_idx = (torch.arange(seq_len, device=hidden.device) % block_size).unsqueeze(0)
+    dpace = per_position_loss_weight == "dpace"
+    decay = (
+        None
+        if dpace
+        else dflash_loss_decay(
+            pos_idx.float(), gamma=gamma, sample_from_anchor=sample_from_anchor
+        )
+    )
+    loss, fused_out = flr.fused_linear_reduced(
+        hidden,
+        lm_head_weight,
+        targets,
+        names,
+        [weight for _, weight in loss_config.values()],
+        loss_mask,
+        decay=decay,
+        dpace_alpha=dpace_alpha if dpace else None,
+        block_size=block_size,
+        extra=markov_features,
+        extra_weight=markov_weight,
+        target_weight=target_weight,
+        logits_dtype=logits_dtype,
+        shared_head=shared_head,
+        metric_terms=("tv",),
+    )
+    # Per-term logging values, reduced exactly as the materialized path does.
+    decay_fn = _decay_fn(
+        per_position_loss_weight,
+        loss_mask,
+        block_size,
+        dpace_alpha,
+        gamma,
+        sample_from_anchor,
+    )
+    _, term_losses = _weighted_sum(
+        loss_config,
+        [fused_out.losses[name] for name in names],
+        loss_mask,
+        pos_idx,
+        decay_fn,
+    )
+    out = CompoundLossOutput(
+        loss, term_losses, fused_out.pred_ids, fused_out.target_ids, fused_out.metrics
+    )
+    return _finish(
+        out,
+        None,
+        confidence_logits,
+        loss_mask,
+        block_size,
+        gamma=gamma,
+        confidence_head_alpha=confidence_head_alpha,
+        sample_from_anchor=sample_from_anchor,
+    )
+
+
+def _finish(
+    out: CompoundLossOutput,
+    tv_fallback: Callable[[], torch.Tensor] | None,
+    confidence_logits: torch.Tensor | None,
+    loss_mask: torch.Tensor,
+    block_size: int,
+    gamma: float,
+    confidence_head_alpha: float,
+    sample_from_anchor: bool,
+) -> tuple[torch.Tensor, dict]:
+    """Confidence loss and every DSpark metric from the loss pass's outputs."""
+    device = loss_mask.device
+    seq_len = loss_mask.shape[1]
+    pos_idx = (torch.arange(seq_len, device=device) % block_size).unsqueeze(0)
+    start_pos = 0 if sample_from_anchor else 1
     loss, term_losses = out.loss, out.term_losses
 
     # Analytical per-position acceptance rate = distributional overlap
@@ -105,7 +250,9 @@ def compute_metrics(
     with torch.no_grad():
         tv = out.metric_terms.get("tv")
         if tv is None:
-            tv = tv_loss_fn(logits, targets)
+            if tv_fallback is None:
+                raise ValueError("the loss pass did not provide the TV metric")
+            tv = tv_fallback()
         accept_rate = 1.0 - tv  # [1, T]
         # Per-block cumulative acceptance product over the draft slots (slot 0
         # is the anchor), shared by the accept-length and calibration metrics.

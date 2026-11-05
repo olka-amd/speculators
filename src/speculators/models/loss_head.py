@@ -175,19 +175,36 @@ def loss_head(cfg: HeadConfig, inputs: HeadInputs) -> tuple[torch.Tensor, dict]:
         "sample_from_anchor": SAMPLE_FROM_ANCHOR["dflash"],
     }
     if fused_linear:
-        if cfg.model != "dflash":
-            raise ValueError(f"{cfg.implementation} is only supported for dflash")
+        logits_dtype = {"_fp32": "float32", "_fp16": "float16"}.get(
+            cfg.implementation[-5:], "input"
+        )
+        weight = inputs.verifier_weight if shared_head else inputs.weight
+        target_weight = inputs.verifier_weight if recompute_targets else None
+        if cfg.model == "dspark":
+            # markov_w2(u) is added inside the loss's GEMMs (dspark/core.py)
+            return dspark_metrics.compute_metrics_from_hidden(
+                inputs.hidden.unsqueeze(0),
+                weight,
+                targets,
+                inputs.markov_input.unsqueeze(0),  # type: ignore[union-attr]
+                inputs.markov_weight,
+                None,
+                inputs.loss_mask,
+                cfg.block_size,
+                loss_config,
+                per_position_loss_weight=cfg.weighting,
+                sample_from_anchor=SAMPLE_FROM_ANCHOR["dspark"],
+                target_weight=target_weight,
+                logits_dtype=logits_dtype,
+                shared_head=shared_head,
+            )
         return dflash_metrics.compute_metrics_from_hidden(
             inputs.hidden.unsqueeze(0),
-            inputs.verifier_weight if shared_head else inputs.weight,
+            weight,
             targets,
             inputs.loss_mask,
-            target_weight=inputs.verifier_weight if recompute_targets else None,
-            logits_dtype=(
-                {"_fp32": "float32", "_fp16": "float16"}.get(
-                    cfg.implementation[-5:], "input"
-                )
-            ),
+            target_weight=target_weight,
+            logits_dtype=logits_dtype,
             skip_anchor_rows=True,
             shared_head=shared_head,
             **dflash_kwargs,

@@ -437,7 +437,7 @@ def _autotune_grad_tile(kernel):
     """``_autotune_tile`` for ``loss_grad_kernel``, also keyed on GRAD_TERMS."""
     return triton.autotune(
         configs=_tile_configs(),
-        key=["n_cols", "TERMS", "GRAD_TERMS", "DELTA"],
+        key=["n_cols", "TERMS", "GRAD_TERMS", "DELTA", "FOLD"],
         prune_configs_by={"early_config_prune": _prune_oversized_tiles},
     )(kernel)
 
@@ -486,6 +486,8 @@ def loss_grad_kernel(  # noqa: C901 -- constexpr TERMS branches
     dz_ptr,
     dz_term_stride,
     n_cols,
+    fold_ptr,
+    fold_row,
     TERMS: tl.constexpr,
     GRAD_TERMS: tl.constexpr,
     DZ_KL: tl.constexpr,
@@ -494,6 +496,7 @@ def loss_grad_kernel(  # noqa: C901 -- constexpr TERMS branches
     DZ_CE: tl.constexpr,
     DZ_TV: tl.constexpr,
     DELTA: tl.constexpr,
+    FOLD: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
     """Forward losses plus each GRAD_TERMS term's unit-weight logits gradient.
@@ -507,6 +510,12 @@ def loss_grad_kernel(  # noqa: C901 -- constexpr TERMS branches
     writes the gradients that need only the statistics (KL, CE); a third
     pass writes those that need a finished row total (RKL, JSD, TV).
     Accumulators are per lane and reduced once per row.
+
+    With ``FOLD`` the per-row term weights are known up front
+    (``fold_ptr[TERM_SLOT * fold_row + row]``) and a single slab gets
+    ``sum_t w_t * d loss_t / d z``: written in pass 2 when only KL / CE are
+    differentiated, otherwise in pass 3 (which then also forms KL and CE),
+    so there is one gradient write per element whatever the term count.
     """
     pid = tl.program_id(0).to(tl.int64)
     logits_ptr += pid * n_cols
@@ -552,6 +561,17 @@ def loss_grad_kernel(  # noqa: C901 -- constexpr TERMS branches
     lse_t = 0.0
     if TERMS & _DIST:
         lse_t = _lane_lse(m_t, s_t)
+    w_kl = 0.0
+    w_rkl = 0.0
+    w_jsd = 0.0
+    w_ce = 0.0
+    w_tv = 0.0
+    if FOLD:
+        w_kl = tl.load(fold_ptr + 0 * fold_row + pid)
+        w_rkl = tl.load(fold_ptr + 1 * fold_row + pid)
+        w_jsd = tl.load(fold_ptr + 2 * fold_row + pid)
+        w_ce = tl.load(fold_ptr + 3 * fold_row + pid)
+        w_tv = tl.load(fold_ptr + 4 * fold_row + pid)
 
     # Pass 2: every term, plus the gradients that need only the statistics.
     kl = tl.zeros([BLOCK_SIZE], tl.float32)
@@ -576,9 +596,10 @@ def loss_grad_kernel(  # noqa: C901 -- constexpr TERMS branches
                 )
             ldp = x - lse_d
             dp = tl.exp(ldp)
-            if GRAD_TERMS & _CE:
-                grad = dp - (offsets == target_idx).to(tl.float32)
-                tl.store(dz_ptr + DZ_CE * dz_term_stride + offsets, grad, mask=mask)
+            if not FOLD:  # noqa: SIM102 -- constexpr branches
+                if GRAD_TERMS & _CE:
+                    grad = dp - (offsets == target_idx).to(tl.float32)
+                    tl.store(dz_ptr + DZ_CE * dz_term_stride + offsets, grad, mask=mask)
             if TERMS & _DIST:
                 ltp = y - lse_t
                 tp = tl.exp(ltp)
@@ -593,10 +614,21 @@ def loss_grad_kernel(  # noqa: C901 -- constexpr TERMS branches
                 if TERMS & _TV:
                     tv_min += tl.where(mask, tl.minimum(dp, tp), 0.0)
                     tv_s += tl.where(mask & (dp <= tp), dp, 0.0)
-                if GRAD_TERMS & _KL:
-                    tl.store(
-                        dz_ptr + DZ_KL * dz_term_stride + offsets, dp - tp, mask=mask
-                    )
+                if not FOLD:  # noqa: SIM102 -- constexpr branches
+                    if GRAD_TERMS & _KL:
+                        tl.store(
+                            dz_ptr + DZ_KL * dz_term_stride + offsets,
+                            dp - tp,
+                            mask=mask,
+                        )
+            if FOLD:  # noqa: SIM102 -- constexpr branches
+                if (GRAD_TERMS & (_RKL | _JSD | _TV)) == 0:
+                    folded = tl.zeros([BLOCK_SIZE], tl.float32)
+                    if GRAD_TERMS & _CE:
+                        folded += w_ce * (dp - (offsets == target_idx).to(tl.float32))
+                    if GRAD_TERMS & _KL:
+                        folded += w_kl * (dp - tp)
+                    tl.store(dz_ptr + offsets, folded, mask=mask)
 
     rkl_loss = tl.sum(rkl)
     jsd_kl_mix = tl.sum(jsd_d)
@@ -623,15 +655,36 @@ def loss_grad_kernel(  # noqa: C901 -- constexpr TERMS branches
             ltp = y - lse_t
             dp = tl.exp(ldp)
             tp = tl.exp(ltp)
+            folded = tl.zeros([BLOCK_SIZE], tl.float32)
+            if FOLD:
+                if GRAD_TERMS & _CE:
+                    folded += w_ce * (dp - (offsets == target_idx).to(tl.float32))
+                if GRAD_TERMS & _KL:
+                    folded += w_kl * (dp - tp)
             if GRAD_TERMS & _RKL:
                 grad = dp * (ldp - ltp - rkl_loss)
-                tl.store(dz_ptr + DZ_RKL * dz_term_stride + offsets, grad, mask=mask)
+                if FOLD:
+                    folded += w_rkl * grad
+                else:
+                    tl.store(
+                        dz_ptr + DZ_RKL * dz_term_stride + offsets, grad, mask=mask
+                    )
             if GRAD_TERMS & _JSD:
                 grad = 0.5 * dp * (ldp - _log_mix(ldp, ltp) - jsd_kl_mix)
-                tl.store(dz_ptr + DZ_JSD * dz_term_stride + offsets, grad, mask=mask)
+                if FOLD:
+                    folded += w_jsd * grad
+                else:
+                    tl.store(
+                        dz_ptr + DZ_JSD * dz_term_stride + offsets, grad, mask=mask
+                    )
             if GRAD_TERMS & _TV:
                 grad = -dp * ((dp <= tp).to(tl.float32) - tv_ss)
-                tl.store(dz_ptr + DZ_TV * dz_term_stride + offsets, grad, mask=mask)
+                if FOLD:
+                    folded += w_tv * grad
+                else:
+                    tl.store(dz_ptr + DZ_TV * dz_term_stride + offsets, grad, mask=mask)
+            if FOLD:
+                tl.store(dz_ptr + offsets, folded, mask=mask)
 
 
 class _FusedLoss(torch.autograd.Function):

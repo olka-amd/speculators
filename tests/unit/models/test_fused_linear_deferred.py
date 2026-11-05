@@ -181,11 +181,11 @@ def test_option_validation():
 
 
 @pytest.mark.parametrize(
-    ("rows", "expected"), [(15360, 2048), (16384, 2048), (1500, 1500), (100, 100)]
+    ("rows", "expected"), [(15360, 4096), (16384, 4096), (1500, 1500), (100, 100)]
 )
-def test_chunk_rows_capped_at_2048(rows, expected, monkeypatch):
-    """2048-row chunks (remainder tail): the fastest measured shape for both
-    the projection and the dz @ W contraction on MI355X."""
+def test_chunk_rows_capped_at_4096(rows, expected, monkeypatch):
+    """Chunks of at most 4096 rows (remainder tail): within the 4 GiB budget
+    at V = 152k with bf16 tiles, and faster than 2048 on a shared MI355X."""
     monkeypatch.delenv("SPECULATORS_FUSED_LINEAR_BUDGET_MIB", raising=False)
     assert fl.chunk_rows_for(151936, torch.bfloat16, rows, recompute_targets=True) == (
         expected
@@ -272,6 +272,8 @@ def test_loss_grad_kernel_matches_existing_kernels(dtype, vocab, names):
             dz,
             rows * vocab,
             vocab,
+            None,
+            0,
             TERMS=fused.terms_mask(names),
             GRAD_TERMS=fused.terms_mask(names),
             DZ_KL=slot.get("kl_div", 0),
@@ -280,6 +282,7 @@ def test_loss_grad_kernel_matches_existing_kernels(dtype, vocab, names):
             DZ_CE=slot.get("ce", 0),
             DZ_TV=slot.get("tv", 0),
             DELTA=False,
+            FOLD=False,
         )
         assert torch.equal(argmax[0], logits.argmax(-1))
         assert torch.equal(argmax[1], targets.argmax(-1))

@@ -147,8 +147,8 @@ def test_rejects_trainable_weight_and_misaligned_targets():
 
 def test_chunk_rows_for(monkeypatch):
     monkeypatch.delenv("SPECULATORS_FUSED_LINEAR_BUDGET_MIB", raising=False)
-    # 4 GiB / (151936 * (4 + 2) B) fits 4710 rows; capped at 2048
-    assert fl.chunk_rows_for(151936, torch.bfloat16, 16384) == 2048
+    # 4 GiB / (151936 * (2 + 2) B) fits 7065 rows; capped at 4096
+    assert fl.chunk_rows_for(151936, torch.bfloat16, 16384) == 4096
     assert fl.chunk_rows_for(151936, torch.bfloat16, 100) == 100
     monkeypatch.setenv("SPECULATORS_FUSED_LINEAR_BUDGET_MIB", "1")
     assert fl.chunk_rows_for(151936, torch.bfloat16, 16384) == 64

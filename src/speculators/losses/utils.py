@@ -194,10 +194,11 @@ def resolve_loss_config(spec: str, implementation: str = "fused") -> LossConfig:
     loss names to weights (``'{"ce": 0.1, "tv": 0.9}'``).
     """
     if implementation == "fused_linear":
-        # Models that support it (DFlash) resolve their config with "fused"
+        # Models that support it (DFlash, DSpark) resolve their config with "fused"
         # and take the hidden-state path themselves.
         raise ValueError(
-            "loss_implementation='fused_linear' is only supported by DFlash; "
+            "loss_implementation='fused_linear' is only supported by DFlash and "
+            "DSpark; "
             "use 'fused' or 'eager' for this model"
         )
     try:
